@@ -1,3 +1,15 @@
+# 실험 실행 방법
+1. conda 가상환경 openvla 활성화.
+2. ~/home2/chanhwi/workspace/openvla-oft 가기.
+3. python mesaure_latency.py
+
+## 변경 가능한 실험 설정
+1. NUM_EPISODES: 상황 가짓수, 기본값 10.
+2. LIBERO_TASK_SUITE: 작업 목표, 기본값 libero_suite.
+ex1) NUM_EPISODES=2 python measure_latency.py 빠른 측정.
+ex2) NUM_EPISODES=5 LIBERO_TASK_SUITE=libero_object python measure_latency.py # 에피소드 5개만(기본10개), 다른 태스크.
+
+
 # OFT Post-Inference Latency Measurement (LIBERO)
 
 Measures the delay between **action-chunk-ready** and **actuator-command-ready** in
