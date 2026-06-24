@@ -217,12 +217,39 @@ def _patch_torch_load() -> None:
     torch.load = _load
 
 
+def _maybe_disable_cudnn() -> None:
+    """
+    On Jetson Orin the bundled cuDNN can fail to initialize
+    (CUDNN_STATUS_NOT_INITIALIZED) even though it reports as available. We probe
+    a tiny conv and, if cuDNN is broken, disable it. This only affects the VLA
+    forward pass (a single vision conv; the transformer uses cuBLAS) which is
+    EXCLUDED from the measured region, so it has no effect on the latency result.
+    On machines where cuDNN works (e.g. RTX 5090) it is left enabled.
+    """
+    import torch
+    if not torch.cuda.is_available():
+        return
+    try:
+        x = torch.randn(1, 3, 8, 8, device="cuda")
+        w = torch.randn(4, 3, 3, 3, device="cuda")
+        torch.nn.functional.conv2d(x, w)
+        torch.cuda.synchronize()
+    except RuntimeError as e:
+        if "cudnn" in str(e).lower():
+            torch.backends.cudnn.enabled = False
+            print("[note] cuDNN failed to initialize -> disabled "
+                  "(affects only the excluded forward pass).")
+        else:
+            raise
+
+
 # =============================================================================
 #  Main measurement loop  (a timed variant of run_libero_eval.run_episode)
 # =============================================================================
 def run(cfg_user: Config) -> None:
     validate_config(cfg_user)
     _patch_torch_load()
+    _maybe_disable_cudnn()
 
     # Import here so a config error doesn't require the full stack.
     from experiments.robot.libero.run_libero_eval import (
