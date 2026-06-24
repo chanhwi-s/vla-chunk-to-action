@@ -196,11 +196,33 @@ def compute_actuator_command(env, action: np.ndarray) -> None:
     rs_env.robots[0].control(action, policy_step=True)
 
 
+def _patch_torch_load() -> None:
+    """
+    PyTorch >= 2.6 defaults torch.load(weights_only=True), which rejects the
+    numpy arrays stored in LIBERO's init-state files. All files we load are
+    trusted (LIBERO package data + official checkpoints), so default to
+    weights_only=False for calls that don't explicitly set it. Calls that pass
+    weights_only=True (e.g. action_head/proprio loads) are left untouched.
+    """
+    import torch
+    if getattr(torch.load, "_patched_wo", False):
+        return
+    _orig = torch.load
+
+    def _load(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return _orig(*args, **kwargs)
+
+    _load._patched_wo = True
+    torch.load = _load
+
+
 # =============================================================================
 #  Main measurement loop  (a timed variant of run_libero_eval.run_episode)
 # =============================================================================
 def run(cfg_user: Config) -> None:
     validate_config(cfg_user)
+    _patch_torch_load()
 
     # Import here so a config error doesn't require the full stack.
     from experiments.robot.libero.run_libero_eval import (
