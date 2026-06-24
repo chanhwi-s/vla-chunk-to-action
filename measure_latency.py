@@ -247,6 +247,13 @@ def _maybe_disable_cudnn() -> None:
 #  Main measurement loop  (a timed variant of run_libero_eval.run_episode)
 # =============================================================================
 def run(cfg_user: Config) -> None:
+    # Optional env overrides for quick runs without editing the file, e.g.:
+    #   NUM_EPISODES=2 LIBERO_TASK_SUITE=libero_object python measure_latency.py
+    if os.environ.get("NUM_EPISODES"):
+        cfg_user.NUM_EPISODES = int(os.environ["NUM_EPISODES"])
+    if os.environ.get("LIBERO_TASK_SUITE"):
+        cfg_user.LIBERO_TASK_SUITE = os.environ["LIBERO_TASK_SUITE"]
+
     validate_config(cfg_user)
     _patch_torch_load()
     _maybe_disable_cudnn()
@@ -297,7 +304,8 @@ def run(cfg_user: Config) -> None:
     rows = []                # CSV: episode, sim_step, latency_ms
     chunk_counter = 0
 
-    for ep in range(cfg_user.NUM_EPISODES):
+    try:
+      for ep in range(cfg_user.NUM_EPISODES):
         task_id = ep % num_tasks
         task = task_suite.get_task(task_id)
         env, task_description = get_libero_env(task, cfg.model_family, resolution=cfg.env_img_res)
@@ -370,11 +378,14 @@ def run(cfg_user: Config) -> None:
 
         print(f"  [episode {ep + 1:>3}/{cfg_user.NUM_EPISODES}] "
               f"task_id={task_id} samples={len(samples_ms)}")
+    except KeyboardInterrupt:
+        print("\n[interrupted] reporting partial results collected so far...")
 
     report(samples_ms)
     if cfg_user.SAVE_CSV:
-        write_csv(cfg_user.CSV_PATH, rows, cfg_user, hw, samples_ms)
-        print(f"\nRaw samples written to: {cfg_user.CSV_PATH}")
+        out_path = _resolve_csv_path(cfg_user, cfg.task_suite_name)
+        write_csv(out_path, rows, cfg_user, hw, samples_ms)
+        print(f"\nRaw samples written to: {out_path}")
 
 
 # =============================================================================
@@ -396,6 +407,25 @@ def report(samples_ms) -> None:
     print(f"Min / Median / Max : {arr.min():.6f} / {np.median(arr):.6f} / {arr.max():.6f} ms")
     print(f"p95 / p99          : {np.percentile(arr, 95):.6f} / {np.percentile(arr, 99):.6f} ms")
     print("-" * 72)
+
+
+def _resolve_csv_path(cfg_user: Config, suite: str) -> str:
+    """
+    Save CSVs into <repo>/results/ next to this script. We resolve the real file
+    location via realpath(), so even when the script is run through a symlink in
+    the openvla-oft repo, results land in YOUR vla-chunk-to-action repo. A suite
+    name + timestamp are appended so successive runs don't overwrite each other.
+    Set CSV_PATH to an absolute path to override this behavior.
+    """
+    if os.path.isabs(cfg_user.CSV_PATH):
+        out = cfg_user.CSV_PATH
+    else:
+        repo_dir = os.path.dirname(os.path.realpath(__file__))
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        stem, ext = os.path.splitext(os.path.basename(cfg_user.CSV_PATH))
+        out = os.path.join(repo_dir, "results", f"{stem}_{suite}_{ts}{ext}")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    return out
 
 
 def write_csv(path, rows, cfg_user: Config, hw: str, samples_ms) -> None:
