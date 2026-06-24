@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.csv
+*.pt
+*.bin
+*.safetensors
+checkpoints/
+*.egg-info/
+.venv/
+.DS_Store
+
+notes/
