@@ -95,6 +95,13 @@ class Config:
     # to adapt. Set False to time only chunk-slice + gripper post-processing.
     MEASURE_CONTROLLER_COMPUTE: bool = True
 
+    # ── VLA forward (perception + inference) timing ──────────────────────────
+    # True -> also time get_action() (vision encode + LLM + parallel decode +
+    # unnormalize) with CUDA synchronization, so you can compare the VLA forward
+    # overhead against the post-inference (chunking->actuation) latency. Recorded
+    # in a separate CSV column and summarized with a ratio in the report.
+    MEASURE_FORWARD: bool = True
+
     # ── Output ───────────────────────────────────────────────────────────────
     SAVE_CSV: bool = True
     CSV_PATH: str = "latency_results.csv"
@@ -106,6 +113,51 @@ class Config:
 
 
 CONFIG = Config()
+
+# Map config.yaml keys (snake_case) -> Config fields (UPPER_CASE).
+_YAML_TO_FIELD = {
+    "model_path": "MODEL_PATH",
+    "device": "DEVICE",
+    "libero_task_suite": "LIBERO_TASK_SUITE",
+    "num_episodes": "NUM_EPISODES",
+    "action_chunk_size": "ACTION_CHUNK_SIZE",
+    "measure_controller_compute": "MEASURE_CONTROLLER_COMPUTE",
+    "measure_forward": "MEASURE_FORWARD",
+    "save_csv": "SAVE_CSV",
+    "csv_path": "CSV_PATH",
+    "num_steps_wait": "NUM_STEPS_WAIT",
+    "warmup_chunks": "WARMUP_CHUNKS",
+    "seed": "SEED",
+}
+
+
+def load_config() -> Config:
+    """
+    Load hyperparameters from config.yaml sitting next to this script (resolved
+    through the symlink via realpath). Falls back to the Config defaults above if
+    the file or PyYAML is missing. Env vars (NUM_EPISODES / LIBERO_TASK_SUITE)
+    applied in run() still override these.
+    """
+    cfg = Config()
+    cfg_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "config.yaml")
+    if not os.path.exists(cfg_path):
+        print(f"[note] no config.yaml found at {cfg_path}; using script defaults.")
+        return cfg
+    try:
+        import yaml
+    except ModuleNotFoundError:
+        print("[note] PyYAML not installed; using script defaults. "
+              "(pip install pyyaml to use config.yaml)")
+        return cfg
+    with open(cfg_path) as f:
+        data = yaml.safe_load(f) or {}
+    for k, v in data.items():
+        if k in _YAML_TO_FIELD:
+            setattr(cfg, _YAML_TO_FIELD[k], v)
+        else:
+            print(f"[warn] unknown config.yaml key ignored: {k}")
+    return cfg
+
 
 # OFT checkpoints that have matching action_head + proprio_projector on HF Hub.
 SUITE_TO_CHECKPOINT = {
@@ -286,10 +338,19 @@ def run(cfg_user: Config) -> None:
     print(f"  suite        : {cfg.task_suite_name}   episodes={cfg_user.NUM_EPISODES}")
     print(f"  chunk size   : {cfg.num_open_loop_steps}")
     print(f"  ctrl compute : {cfg_user.MEASURE_CONTROLLER_COMPUTE}")
+    print(f"  measure fwd  : {cfg_user.MEASURE_FORWARD}")
     print(f"  hardware     : {hw}")
     print("=" * 72)
 
     set_seed_everywhere(cfg.seed)
+
+    # CUDA sync helper for accurate GPU (forward) timing.
+    import torch
+    _cuda = torch.cuda.is_available() and cfg_user.DEVICE.startswith("cuda")
+
+    def _sync():
+        if _cuda:
+            torch.cuda.synchronize()
 
     # initialize_model() also sets cfg.unnorm_key via check_unnorm_key().
     model, action_head, proprio_projector, noisy_action_projector, processor = initialize_model(cfg)
@@ -300,8 +361,9 @@ def run(cfg_user: Config) -> None:
     num_tasks = task_suite.n_tasks
     max_steps = TASK_MAX_STEPS[TaskSuite(cfg.task_suite_name)]
 
-    samples_ms = []          # one (T_end - T_start) sample per action chunk
-    rows = []                # CSV: episode, sim_step, latency_ms
+    samples_ms = []          # post-inference latency (T_end - T_start) per chunk
+    forward_ms = []          # VLA forward (perception + inference) per chunk
+    rows = []                # CSV: episode, sim_step, forward_ms, latency_ms
     chunk_counter = 0
 
     try:
@@ -327,8 +389,14 @@ def run(cfg_user: Config) -> None:
                 observation, _ = prepare_observation(obs, resize_size)
 
                 measure = False
+                forward_val = None
                 if len(action_queue) == 0:
-                    # ---- VLA forward + parallel decode + unnormalize (EXCLUDED) ----
+                    # ---- VLA forward + parallel decode + unnormalize ----
+                    # Timed (with CUDA sync) when MEASURE_FORWARD, but this region
+                    # is still EXCLUDED from the post-inference latency below.
+                    if cfg_user.MEASURE_FORWARD:
+                        _sync()
+                        f0 = time.perf_counter()
                     actions = get_action(
                         cfg, model, observation, task_description,
                         processor=processor,
@@ -337,6 +405,9 @@ def run(cfg_user: Config) -> None:
                         noisy_action_projector=noisy_action_projector,
                         use_film=cfg.use_film,
                     )
+                    if cfg_user.MEASURE_FORWARD:
+                        _sync()
+                        forward_val = (time.perf_counter() - f0) * 1e3
                     # ===================== T_start ==============================
                     # Chunk fully decoded & in memory. Forward pass already done.
                     t_start = time.perf_counter()
@@ -358,7 +429,10 @@ def run(cfg_user: Config) -> None:
                     if chunk_counter >= cfg_user.WARMUP_CHUNKS:
                         ms = (t_end - t_start) * 1e3
                         samples_ms.append(ms)
-                        rows.append((ep, t, ms))
+                        if forward_val is not None:
+                            forward_ms.append(forward_val)
+                        rows.append((ep, t,
+                                     "" if forward_val is None else forward_val, ms))
                     chunk_counter += 1
                 else:
                     action = process_action(action, cfg.model_family)
@@ -381,31 +455,43 @@ def run(cfg_user: Config) -> None:
     except KeyboardInterrupt:
         print("\n[interrupted] reporting partial results collected so far...")
 
-    report(samples_ms)
+    report(samples_ms, forward_ms)
     if cfg_user.SAVE_CSV:
         out_path = _resolve_csv_path(cfg_user, cfg.task_suite_name)
-        write_csv(out_path, rows, cfg_user, hw, samples_ms)
+        write_csv(out_path, rows, cfg_user, hw, samples_ms, forward_ms)
         print(f"\nRaw samples written to: {out_path}")
 
 
 # =============================================================================
 #  Reporting
 # =============================================================================
-def report(samples_ms) -> None:
+def _summarize(label, data) -> dict:
+    arr = np.asarray(data, dtype=np.float64)
+    mean = float(arr.mean())
+    var = float(arr.var())          # population variance (ms^2)
+    print(f"\n[{label}]  (n={len(arr)})")
+    print(f"  Mean        : {mean:.6f} ms")
+    print(f"  Variance    : {var:.6f} ms^2")
+    print(f"  Std dev     : {var ** 0.5:.6f} ms")
+    print(f"  Min/Med/Max : {arr.min():.6f} / {np.median(arr):.6f} / {arr.max():.6f} ms")
+    print(f"  p95 / p99   : {np.percentile(arr, 95):.6f} / {np.percentile(arr, 99):.6f} ms")
+    return {"mean": mean, "var": var}
+
+
+def report(samples_ms, forward_ms=None) -> None:
     if not samples_ms:
         print("\n[!] No samples collected — check the run.")
         return
-    mean = statistics.fmean(samples_ms)
-    var = statistics.pvariance(samples_ms, mu=mean)   # population variance (ms^2)
-    std = var ** 0.5
-    arr = np.asarray(samples_ms)
     print("\n" + "-" * 72)
-    print(f"Samples (n)        : {len(samples_ms)}")
-    print(f"Mean latency       : {mean:.6f} ms")
-    print(f"Variance           : {var:.6f} ms^2")
-    print(f"Std deviation      : {std:.6f} ms")
-    print(f"Min / Median / Max : {arr.min():.6f} / {np.median(arr):.6f} / {arr.max():.6f} ms")
-    print(f"p95 / p99          : {np.percentile(arr, 95):.6f} / {np.percentile(arr, 99):.6f} ms")
+    post = _summarize("Post-inference latency (chunk -> actuator cmd)", samples_ms)
+    if forward_ms:
+        fwd = _summarize("VLA forward (perception + inference)", forward_ms)
+        # Comparison: how the two stages relate.
+        print("\n[Comparison]")
+        print(f"  forward mean / post-inference mean = "
+              f"{fwd['mean'] / post['mean']:.1f}x")
+        print(f"  post-inference is {100 * post['mean'] / (fwd['mean'] + post['mean']):.2f}% "
+              f"of (forward + post-inference)")
     print("-" * 72)
 
 
@@ -428,18 +514,22 @@ def _resolve_csv_path(cfg_user: Config, suite: str) -> str:
     return out
 
 
-def write_csv(path, rows, cfg_user: Config, hw: str, samples_ms) -> None:
+def write_csv(path, rows, cfg_user: Config, hw: str, samples_ms, forward_ms=None) -> None:
     mean = statistics.fmean(samples_ms) if samples_ms else float("nan")
     var = statistics.pvariance(samples_ms) if len(samples_ms) > 1 else float("nan")
+    fwd_mean = statistics.fmean(forward_ms) if forward_ms else float("nan")
+    fwd_var = statistics.pvariance(forward_ms) if forward_ms and len(forward_ms) > 1 else float("nan")
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         for k, v in asdict(cfg_user).items():
             w.writerow([f"# {k}", v])
         w.writerow(["# hardware", hw])
-        w.writerow(["# mean_ms", mean])
-        w.writerow(["# variance_ms2", var])
+        w.writerow(["# post_inference_mean_ms", mean])
+        w.writerow(["# post_inference_variance_ms2", var])
+        w.writerow(["# forward_mean_ms", fwd_mean])
+        w.writerow(["# forward_variance_ms2", fwd_var])
         w.writerow([])
-        w.writerow(["episode", "sim_step", "latency_ms"])
+        w.writerow(["episode", "sim_step", "forward_ms", "latency_ms"])
         w.writerows(rows)
 
 
@@ -459,7 +549,7 @@ def detect_hardware(cfg_user: Config) -> str:
 
 if __name__ == "__main__":
     try:
-        run(CONFIG)
+        run(load_config())
     except ModuleNotFoundError as e:
         print(f"\n[!] Missing dependency / wrong working dir: {e}", file=sys.stderr)
         print("    Run from the openvla-oft repo root (so experiments.* / prismatic.* "

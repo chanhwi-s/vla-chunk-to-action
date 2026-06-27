@@ -1,0 +1,37 @@
+# =============================================================================
+#  config.yaml — hyperparameters for measure_latency.py
+#  Edit values here instead of the script. Loaded from the directory next to the
+#  script (resolved through the symlink). Env vars NUM_EPISODES /
+#  LIBERO_TASK_SUITE still override these at runtime.
+# =============================================================================
+
+# ── Model ──
+model_path: ""              # "" = auto-pick the OFT checkpoint matching the suite
+device: cuda                # cuda | cuda:0 | cpu
+
+# ── Benchmark ──
+# libero_spatial : same objects, different spatial layouts (spatial reasoning)
+# libero_object  : same layout, different objects          (object generalization)
+# libero_goal    : same objects+layout, different goals    (goal generalization)
+# libero_10      : 10 long-horizon tasks (LIBERO-Long)
+libero_task_suite: libero_spatial
+num_episodes: 10
+
+# ── Action chunk ──
+# Must match the checkpoint's NUM_ACTIONS_CHUNK (OFT-LIBERO = 8; base 7b = 1).
+action_chunk_size: 8
+
+# ── What to measure ──
+# include OSC controller compute (manipulation + control) in the post-inference timing
+measure_controller_compute: true
+# also time the VLA forward (perception + inference) for comparison
+measure_forward: true
+
+# ── Output ──
+save_csv: true
+csv_path: latency_results.csv
+
+# ── Run control ──
+num_steps_wait: 10          # sim settling steps (dummy action, not measured)
+warmup_chunks: 2            # discard first K chunk samples (CUDA/JIT warmup)
+seed: 7
